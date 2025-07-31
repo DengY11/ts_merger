@@ -1,14 +1,16 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+
+	ffmpeg "github.com/u2takey/ffmpeg-go"
 )
 
 const videoDir = "./videos"
@@ -19,33 +21,44 @@ type FileInfo struct {
 	StartTime float64
 }
 
+type FFProbeFormat struct {
+	StartTime string `json:"start_time"`
+}
+
+type FFProbeResult struct {
+	Format FFProbeFormat `json:"format"`
+}
+
 func getStartTime(filename string) float64 {
-	cmd := exec.Command("ffprobe",
-		"-v", "quiet",
-		"-show_entries", "format=start_time",
-		"-of", "csv=p=0",
-		filename,
-	)
-	output, err := cmd.Output()
+	output, err := ffmpeg.Probe(filename)
 	if err != nil {
 		fmt.Printf("ffprobe错误 %s: %v\n", filename, err)
 		return 0
 	}
-	startTimeStr := strings.TrimSpace(string(output))
+
+	var result FFProbeResult
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		fmt.Printf("JSON解析错误 %s: %v\n", filename, err)
+		return 0
+	}
+
+	startTimeStr := result.Format.StartTime
 	if startTimeStr == "" || startTimeStr == "N/A" {
 		fmt.Printf("文件 %s 没有start_time信息\n", filename)
 		return 0
 	}
+
 	if startTime, err := strconv.ParseFloat(startTimeStr, 64); err == nil {
 		fmt.Printf("文件 %s start_time: %.6f\n", filename, startTime)
 		return startTime
+	} else {
+		fmt.Printf("文件 %s start_time解析失败: %s\n", filename, startTimeStr)
+		return 0
 	}
-	fmt.Printf("解析start_time失败 %s: %s\n", filename, startTimeStr)
-	return 0
 }
 
 func isBakFile(filename string) bool {
-	// 目前只检查了文件名是否含有“bak"
+	// 目前只检查了文件名是否含有"bak"
 	return strings.Contains(strings.ToLower(filename), "bak")
 }
 
@@ -63,44 +76,62 @@ func mergeFiles(files []FileInfo, output string) error {
 	}
 	f.Close()
 	defer os.Remove(listFile)
-	cmd := exec.Command("ffmpeg", "-f", "concat", "-safe", "0", "-i", listFile, "-c", "copy", "-y", output)
-	return cmd.Run()
+	err = ffmpeg.Input(listFile, ffmpeg.KwArgs{
+		"f":    "concat",
+		"safe": "0",
+	}).
+		Output(output, ffmpeg.KwArgs{
+			"c": "copy",
+		}).
+		OverWriteOutput().
+		Run()
+
+	return err
 }
 
 func mergeFinal(files []string, output string) error {
 	fmt.Printf("开始最终合并，重新生成时间戳\n")
-	var inputs []string
-	var filterComplex string
-	for i, file := range files {
-		inputs = append(inputs, "-i", file)
-		if i == 0 {
-			filterComplex = fmt.Sprintf("[0:v] [0:a]")
-		} else {
-			filterComplex += fmt.Sprintf(" [%d:v] [%d:a]", i, i)
-		}
-	}
-	filterComplex += fmt.Sprintf(" concat=n=%d:v=1:a=1 [v] [a]", len(files))
-	args := []string{"-y"}
-	args = append(args, inputs...)
-	args = append(args, "-filter_complex", filterComplex)
-	args = append(args, "-map", "[v]", "-map", "[a]")
-	args = append(args, "-c:v", "libx264", "-preset", "fast", "-crf", "23")
-	args = append(args, "-c:a", "aac", "-b:a", "128k")
-	args = append(args, output)
-	cmd := exec.Command("ffmpeg", args...)
-	fmt.Printf("执行命令: %s\n", cmd.String())
-	combinedOutput, err := cmd.CombinedOutput()
+	listFile := "temp_final_list.txt"
+	f, err := os.Create(listFile)
 	if err != nil {
-		fmt.Printf("FFmpeg输出:\n%s\n", string(combinedOutput))
 		return err
 	}
+	for _, file := range files {
+		fmt.Fprintf(f, "file '%s'\n", file)
+	}
+	f.Close()
+	defer os.Remove(listFile)
+	err = ffmpeg.Input(listFile, ffmpeg.KwArgs{
+		"f":    "concat",
+		"safe": "0",
+	}).
+		Output(output, ffmpeg.KwArgs{
+			"c:v":    "libx264",
+			"preset": "fast",
+			"crf":    "23",
+			"c:a":    "aac",
+			"b:a":    "128k",
+		}).
+		OverWriteOutput().
+		Run()
+
+	if err != nil {
+		return err
+	}
+
 	fmt.Printf("合并成功\n")
 	return nil
 }
 
 func copyFile(src, dst string) error {
-	cmd := exec.Command("cp", src, dst)
-	return cmd.Run()
+	err := ffmpeg.Input(src).
+		Output(dst, ffmpeg.KwArgs{
+			"c": "copy",
+		}).
+		OverWriteOutput().
+		Run()
+
+	return err
 }
 
 func main() {
@@ -184,8 +215,13 @@ func main() {
 		}
 	} else if len(finalFiles) == 1 {
 		fmt.Println("转换为MP4...")
-		cmd := exec.Command("ffmpeg", "-i", finalFiles[0], "-c", "copy", "-y", "final_merged.mp4")
-		if err := cmd.Run(); err != nil {
+		err := ffmpeg.Input(finalFiles[0]).
+			Output("final_merged.mp4", ffmpeg.KwArgs{
+				"c": "copy",
+			}).
+			OverWriteOutput().
+			Run()
+		if err != nil {
 			log.Fatal("转换MP4失败:", err)
 		}
 		fmt.Println("转换完成: final_merged.mp4")
