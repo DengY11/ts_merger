@@ -3,7 +3,9 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -13,7 +15,10 @@ import (
 	ffmpeg "github.com/u2takey/ffmpeg-go"
 )
 
-const videoDir = "./videos"
+const (
+	videoDir = "./videos" //本地模式下，将使用这个目录下的文件
+	tempDir  = "./temp"   // 临时合并目录
+)
 
 type FileInfo struct {
 	Name      string
@@ -27,6 +32,62 @@ type FFProbeFormat struct {
 
 type FFProbeResult struct {
 	Format FFProbeFormat `json:"format"`
+}
+
+func downloadFile(url, localPath string) error {
+	fmt.Printf("下载文件: %s\n", filepath.Base(url))
+	if err := os.MkdirAll(filepath.Dir(localPath), 0755); err != nil {
+		return fmt.Errorf("创建目录失败: %v", err)
+	}
+	resp, err := http.Get(url)
+	if err != nil {
+		return fmt.Errorf("下载失败: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("下载失败，状态码: %d", resp.StatusCode)
+	}
+	file, err := os.Create(localPath)
+	if err != nil {
+		return fmt.Errorf("创建本地文件失败: %v", err)
+	}
+	defer file.Close()
+	_, err = io.Copy(file, resp.Body)
+	if err != nil {
+		return fmt.Errorf("保存文件失败: %v", err)
+	}
+	return nil
+}
+
+func downloadFromCDN(fileURL string) error {
+	os.RemoveAll(tempDir)
+	if err := os.MkdirAll(tempDir, 0755); err != nil {
+		return fmt.Errorf("创建临时目录失败: %v", err)
+	}
+
+	fmt.Printf("开始下载文件: %s\n", fileURL)
+	isBak := strings.Contains(fileURL, "/bak/")
+	// 生成本地文件名
+	fileName := filepath.Base(fileURL)
+	if fileName == "" {
+		return fmt.Errorf("无效的文件URL: %s", fileURL)
+	}
+	// 如果是bak目录的文件，添加bak前缀（如果还没有）
+	localFileName := fileName
+	if isBak && !strings.HasPrefix(fileName, "bak_") {
+		localFileName = "bak_" + fileName
+	}
+	localPath := filepath.Join(tempDir, localFileName)
+	fileType := "主"
+	if isBak {
+		fileType = "备份"
+	}
+	fmt.Printf("下载%s文件: %s\n", fileType, fileName)
+	if err := downloadFile(fileURL, localPath); err != nil {
+		return fmt.Errorf("下载文件失败: %v", err)
+	}
+	fmt.Printf("文件下载完成: %s\n", localFileName)
+	return nil
 }
 
 func getStartTime(filename string) float64 {
@@ -135,17 +196,40 @@ func copyFile(src, dst string) error {
 }
 
 func main() {
+	if len(os.Args) > 1 {
+		fmt.Println("使用远程模式")
+		os.RemoveAll(tempDir)
+		if err := os.MkdirAll(tempDir, 0755); err != nil {
+			log.Fatal("创建临时目录失败:", err)
+		}
+		for i := 1; i < len(os.Args); i++ {
+			fileURL := os.Args[i]
+			fmt.Printf("处理URL: %s\n", fileURL)
+			if err := downloadFromCDN(fileURL); err != nil {
+				fmt.Printf("警告: 下载文件失败: %v，跳过\n", err)
+				continue
+			}
+		}
+		processVideoFiles(tempDir)
+		defer os.RemoveAll(tempDir)
+	} else {
+		fmt.Println("使用本地模式")
+		processVideoFiles(videoDir)
+	}
+}
+
+func processVideoFiles(sourceDir string) {
 	// os.Remove("merged_normal.ts")
 	// os.Remove("merged_bak.ts")
 	// os.Remove("final_merged.mp4")
-	entries, err := os.ReadDir(videoDir)
+	entries, err := os.ReadDir(sourceDir)
 	if err != nil {
 		log.Fatal("读取目录失败:", err)
 	}
 	var allFiles []FileInfo
 	for _, entry := range entries {
 		if !entry.IsDir() && strings.HasSuffix(strings.ToLower(entry.Name()), ".ts") {
-			fullPath := filepath.Join(videoDir, entry.Name())
+			fullPath := filepath.Join(sourceDir, entry.Name())
 			fmt.Printf("分析文件: %s\n", fullPath)
 			startTime := getStartTime(fullPath)
 			allFiles = append(allFiles, FileInfo{
