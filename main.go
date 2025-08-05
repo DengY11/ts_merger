@@ -16,8 +16,8 @@ import (
 )
 
 const (
-	videoDir = "./videos" //本地模式下，将使用这个目录下的文件
-	tempDir  = "./temp"   // 临时合并目录
+	videoDir = "./videos"
+	tempDir  = "./temp"
 )
 
 type FileInfo struct {
@@ -32,6 +32,29 @@ type FFProbeFormat struct {
 
 type FFProbeResult struct {
 	Format FFProbeFormat `json:"format"`
+}
+
+func main() {
+	if len(os.Args) > 1 {
+		fmt.Println("使用远程模式")
+		os.RemoveAll(tempDir)
+		if err := os.MkdirAll(tempDir, 0755); err != nil {
+			log.Fatal("创建临时目录失败:", err)
+		}
+		for i := 1; i < len(os.Args); i++ {
+			fileURL := os.Args[i]
+			fmt.Printf("处理URL: %s\n", fileURL)
+			if err := downloadFromCDN(fileURL); err != nil {
+				fmt.Printf("警告: 下载文件失败: %v，跳过\n", err)
+				continue
+			}
+		}
+		processVideoFiles(tempDir)
+		defer os.RemoveAll(tempDir)
+	} else {
+		fmt.Println("使用本地模式")
+		processVideoFiles(videoDir)
+	}
 }
 
 func downloadFile(url, localPath string) error {
@@ -60,19 +83,12 @@ func downloadFile(url, localPath string) error {
 }
 
 func downloadFromCDN(fileURL string) error {
-	os.RemoveAll(tempDir)
-	if err := os.MkdirAll(tempDir, 0755); err != nil {
-		return fmt.Errorf("创建临时目录失败: %v", err)
-	}
-
 	fmt.Printf("开始下载文件: %s\n", fileURL)
 	isBak := strings.Contains(fileURL, "/bak/")
-	// 生成本地文件名
 	fileName := filepath.Base(fileURL)
 	if fileName == "" {
 		return fmt.Errorf("无效的文件URL: %s", fileURL)
 	}
-	// 如果是bak目录的文件，添加bak前缀（如果还没有）
 	localFileName := fileName
 	if isBak && !strings.HasPrefix(fileName, "bak_") {
 		localFileName = "bak_" + fileName
@@ -96,19 +112,16 @@ func getStartTime(filename string) float64 {
 		fmt.Printf("ffprobe错误 %s: %v\n", filename, err)
 		return 0
 	}
-
 	var result FFProbeResult
 	if err := json.Unmarshal([]byte(output), &result); err != nil {
 		fmt.Printf("JSON解析错误 %s: %v\n", filename, err)
 		return 0
 	}
-
 	startTimeStr := result.Format.StartTime
 	if startTimeStr == "" || startTimeStr == "N/A" {
 		fmt.Printf("文件 %s 没有start_time信息\n", filename)
 		return 0
 	}
-
 	if startTime, err := strconv.ParseFloat(startTimeStr, 64); err == nil {
 		fmt.Printf("文件 %s start_time: %.6f\n", filename, startTime)
 		return startTime
@@ -119,8 +132,14 @@ func getStartTime(filename string) float64 {
 }
 
 func isBakFile(filename string) bool {
-	// 目前只检查了文件名是否含有"bak"
 	return strings.Contains(strings.ToLower(filename), "bak")
+}
+
+func copyFile(src, dst string) error {
+	return ffmpeg.Input(src).
+		Output(dst, ffmpeg.KwArgs{"c": "copy"}).
+		OverWriteOutput().
+		Run()
 }
 
 func mergeFiles(files []FileInfo, output string) error {
@@ -137,17 +156,13 @@ func mergeFiles(files []FileInfo, output string) error {
 	}
 	f.Close()
 	defer os.Remove(listFile)
-	err = ffmpeg.Input(listFile, ffmpeg.KwArgs{
+	return ffmpeg.Input(listFile, ffmpeg.KwArgs{
 		"f":    "concat",
 		"safe": "0",
 	}).
-		Output(output, ffmpeg.KwArgs{
-			"c": "copy",
-		}).
+		Output(output, ffmpeg.KwArgs{"c": "copy"}).
 		OverWriteOutput().
 		Run()
-
-	return err
 }
 
 func mergeFinal(files []string, output string) error {
@@ -175,53 +190,14 @@ func mergeFinal(files []string, output string) error {
 		}).
 		OverWriteOutput().
 		Run()
-
 	if err != nil {
 		return err
 	}
-
 	fmt.Printf("合并成功\n")
 	return nil
 }
 
-func copyFile(src, dst string) error {
-	err := ffmpeg.Input(src).
-		Output(dst, ffmpeg.KwArgs{
-			"c": "copy",
-		}).
-		OverWriteOutput().
-		Run()
-
-	return err
-}
-
-func main() {
-	if len(os.Args) > 1 {
-		fmt.Println("使用远程模式")
-		os.RemoveAll(tempDir)
-		if err := os.MkdirAll(tempDir, 0755); err != nil {
-			log.Fatal("创建临时目录失败:", err)
-		}
-		for i := 1; i < len(os.Args); i++ {
-			fileURL := os.Args[i]
-			fmt.Printf("处理URL: %s\n", fileURL)
-			if err := downloadFromCDN(fileURL); err != nil {
-				fmt.Printf("警告: 下载文件失败: %v，跳过\n", err)
-				continue
-			}
-		}
-		processVideoFiles(tempDir)
-		defer os.RemoveAll(tempDir)
-	} else {
-		fmt.Println("使用本地模式")
-		processVideoFiles(videoDir)
-	}
-}
-
 func processVideoFiles(sourceDir string) {
-	// os.Remove("merged_normal.ts")
-	// os.Remove("merged_bak.ts")
-	// os.Remove("final_merged.mp4")
 	entries, err := os.ReadDir(sourceDir)
 	if err != nil {
 		log.Fatal("读取目录失败:", err)
@@ -256,7 +232,6 @@ func processVideoFiles(sourceDir string) {
 	sort.Slice(bakFiles, func(i, j int) bool {
 		return bakFiles[i].StartTime < bakFiles[j].StartTime
 	})
-
 	fmt.Printf("普通文件: %d 个\n", len(normalFiles))
 	for i, file := range normalFiles {
 		fmt.Printf("  %d. %s (开始时间: %.6f)\n", i+1, filepath.Base(file.Name), file.StartTime)
@@ -265,7 +240,7 @@ func processVideoFiles(sourceDir string) {
 	for i, file := range bakFiles {
 		fmt.Printf("  %d. %s (开始时间: %.6f)\n", i+1, filepath.Base(file.Name), file.StartTime)
 	}
-	var normalOutput string
+	var normalOutput, bakOutput string
 	if len(normalFiles) > 0 {
 		normalOutput = "merged_normal.ts"
 		fmt.Printf("合并普通文件到: %s\n", normalOutput)
@@ -273,7 +248,6 @@ func processVideoFiles(sourceDir string) {
 			log.Fatal("合并普通文件失败:", err)
 		}
 	}
-	var bakOutput string
 	if len(bakFiles) > 0 {
 		bakOutput = "merged_bak.ts"
 		fmt.Printf("合并迁移文件到: %s\n", bakOutput)
@@ -300,9 +274,7 @@ func processVideoFiles(sourceDir string) {
 	} else if len(finalFiles) == 1 {
 		fmt.Println("转换为MP4...")
 		err := ffmpeg.Input(finalFiles[0]).
-			Output("final_merged.mp4", ffmpeg.KwArgs{
-				"c": "copy",
-			}).
+			Output("final_merged.mp4", ffmpeg.KwArgs{"c": "copy"}).
 			OverWriteOutput().
 			Run()
 		if err != nil {
