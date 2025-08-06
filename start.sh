@@ -1,0 +1,1 @@
+./simple-merger https://dengyi-test-bucket.oss-cn-beijing.aliyuncs.com/webrecord20250806/session153706/3e5fa8008f40e86d5eec6daceb6d9181_testpagerec1754465826.m3u8 https://dengyi-test-bucket.oss-cn-beijing.aliyuncs.com/webrecord20250806/session153706/bak0_3e5fa8008f40e86d5eec6daceb6d9181_testpagerec1754465826.m3u8

@@ -1,28 +1,29 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	ffmpeg "github.com/u2takey/ffmpeg-go"
 )
 
-const (
-	videoDir = "./videos"
-	tempDir  = "./temp"
-)
+const tempDir = "./temp"
 
 type FileInfo struct {
 	Name      string
-	HasBak    bool
+	Group     string
 	StartTime float64
 }
 
@@ -35,104 +36,212 @@ type FFProbeResult struct {
 }
 
 func main() {
-	if len(os.Args) > 1 {
-		fmt.Println("使用远程模式")
-		os.RemoveAll(tempDir)
-		if err := os.MkdirAll(tempDir, 0755); err != nil {
-			log.Fatal("创建临时目录失败:", err)
+	if len(os.Args) < 2 {
+		fmt.Println("用法: ./simple-merger <m3u8_url1> [m3u8_url2] ...")
+		fmt.Println("示例: ./simple-merger https://example.com/file1.m3u8 https://example.com/bak0_file2.m3u8")
+		os.Exit(1)
+	}
+
+	os.RemoveAll(tempDir)
+	if err := os.MkdirAll(tempDir, 0755); err != nil {
+		log.Fatal("创建临时目录失败:", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	var allFiles []FileInfo
+	for i := 1; i < len(os.Args); i++ {
+		m3u8URL := os.Args[i]
+		fmt.Printf("处理M3U8: %s\n", m3u8URL)
+
+		tsFiles, err := parseM3U8(m3u8URL)
+		if err != nil {
+			fmt.Printf("警告: 解析M3U8失败: %v，跳过\n", err)
+			continue
 		}
-		for i := 1; i < len(os.Args); i++ {
-			fileURL := os.Args[i]
-			fmt.Printf("处理URL: %s\n", fileURL)
-			if err := downloadFromCDN(fileURL); err != nil {
-				fmt.Printf("警告: 下载文件失败: %v，跳过\n", err)
-				continue
+
+		fmt.Printf("找到 %d 个TS文件\n", len(tsFiles))
+		if len(tsFiles) > 0 {
+			fmt.Printf("第一个TS文件: %s\n", tsFiles[0])
+			if len(tsFiles) > 1 {
+				fmt.Printf("最后一个TS文件: %s\n", tsFiles[len(tsFiles)-1])
 			}
 		}
-		processVideoFiles(tempDir)
-		defer os.RemoveAll(tempDir)
-	} else {
-		fmt.Println("使用本地模式")
-		processVideoFiles(videoDir)
+
+		for _, tsURL := range tsFiles {
+			fileName := filepath.Base(tsURL)
+			group := getFileGroup(fileName)
+			localPath := filepath.Join(tempDir, fileName)
+
+			fmt.Printf("下载文件: %s (分组: %s)\n", fileName, group)
+			if err := downloadFile(tsURL, localPath); err != nil {
+				fmt.Printf("警告: 下载失败: %v，跳过\n", err)
+				continue
+			}
+
+			startTime := getStartTime(localPath)
+			allFiles = append(allFiles, FileInfo{
+				Name:      localPath,
+				Group:     group,
+				StartTime: startTime,
+			})
+		}
+	}
+
+	if len(allFiles) == 0 {
+		log.Fatal("没有成功下载任何文件")
+	}
+
+	processAndMerge(allFiles)
+}
+
+func createHTTPClient() *http.Client {
+	return &http.Client{
+		Timeout: 30 * time.Second,
 	}
 }
 
+func parseM3U8(m3u8URL string) ([]string, error) {
+	client := createHTTPClient()
+	req, err := http.NewRequest("GET", m3u8URL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("创建请求失败: %v", err)
+	}
+
+	// 添加常用的请求头
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	req.Header.Set("Connection", "keep-alive")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("获取M3U8文件失败: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("M3U8文件下载失败，状态码: %d", resp.StatusCode)
+	}
+
+	var tsFiles []string
+	scanner := bufio.NewScanner(resp.Body)
+	baseURL, _ := url.Parse(m3u8URL)
+	// 移除文件名部分，保留目录
+	baseURL.Path = filepath.Dir(baseURL.Path)
+	if !strings.HasSuffix(baseURL.Path, "/") {
+		baseURL.Path += "/"
+	}
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if strings.HasPrefix(line, "#") || line == "" {
+			continue
+		}
+
+		if strings.HasSuffix(line, ".ts") {
+			var tsURL string
+			if strings.HasPrefix(line, "http") {
+				tsURL = line
+			} else {
+				tsURL = baseURL.String() + line
+			}
+			tsFiles = append(tsFiles, tsURL)
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("读取M3U8内容失败: %v", err)
+	}
+
+	return tsFiles, nil
+}
+
+func getFileGroup(fileName string) string {
+	if strings.HasPrefix(fileName, "bak") {
+		re := regexp.MustCompile(`^(bak\d+)_`)
+		matches := re.FindStringSubmatch(fileName)
+		if len(matches) > 1 {
+			return matches[1]
+		}
+		return "bak"
+	}
+	return "main"
+}
+
 func downloadFile(url, localPath string) error {
-	fmt.Printf("下载文件: %s\n", filepath.Base(url))
 	if err := os.MkdirAll(filepath.Dir(localPath), 0755); err != nil {
 		return fmt.Errorf("创建目录失败: %v", err)
 	}
-	resp, err := http.Get(url)
+
+	client := createHTTPClient()
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return fmt.Errorf("创建请求失败: %v", err)
+	}
+
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	req.Header.Set("Connection", "keep-alive")
+
+	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("下载失败: %v", err)
 	}
 	defer resp.Body.Close()
+
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("下载失败，状态码: %d", resp.StatusCode)
 	}
+
 	file, err := os.Create(localPath)
 	if err != nil {
 		return fmt.Errorf("创建本地文件失败: %v", err)
 	}
 	defer file.Close()
+
 	_, err = io.Copy(file, resp.Body)
 	if err != nil {
 		return fmt.Errorf("保存文件失败: %v", err)
 	}
-	return nil
-}
 
-func downloadFromCDN(fileURL string) error {
-	fmt.Printf("开始下载文件: %s\n", fileURL)
-	isBak := strings.Contains(fileURL, "/bak/")
-	fileName := filepath.Base(fileURL)
-	if fileName == "" {
-		return fmt.Errorf("无效的文件URL: %s", fileURL)
-	}
-	localFileName := fileName
-	if isBak && !strings.HasPrefix(fileName, "bak_") {
-		localFileName = "bak_" + fileName
-	}
-	localPath := filepath.Join(tempDir, localFileName)
-	fileType := "主"
-	if isBak {
-		fileType = "备份"
-	}
-	fmt.Printf("下载%s文件: %s\n", fileType, fileName)
-	if err := downloadFile(fileURL, localPath); err != nil {
-		return fmt.Errorf("下载文件失败: %v", err)
-	}
-	fmt.Printf("文件下载完成: %s\n", localFileName)
 	return nil
 }
 
 func getStartTime(filename string) float64 {
+	// 优先从文件名提取时间戳
+	baseName := filepath.Base(filename)
+	// 匹配文件名中的时间戳 pattern: hash_testpagerec{start_time}_{end_time}.ts
+	re := regexp.MustCompile(`_testpagerec(\d+)_(\d+)\.ts$`)
+	matches := re.FindStringSubmatch(baseName)
+	if len(matches) >= 3 {
+		if startTime, err := strconv.ParseFloat(matches[1], 64); err == nil {
+			return startTime / 1000.0 // 转换为秒
+		}
+	}
+
+	// 备用方案：使用ffprobe
 	output, err := ffmpeg.Probe(filename)
 	if err != nil {
 		fmt.Printf("ffprobe错误 %s: %v\n", filename, err)
 		return 0
 	}
+
 	var result FFProbeResult
 	if err := json.Unmarshal([]byte(output), &result); err != nil {
 		fmt.Printf("JSON解析错误 %s: %v\n", filename, err)
 		return 0
 	}
+
 	startTimeStr := result.Format.StartTime
 	if startTimeStr == "" || startTimeStr == "N/A" {
-		fmt.Printf("文件 %s 没有start_time信息\n", filename)
 		return 0
 	}
-	if startTime, err := strconv.ParseFloat(startTimeStr, 64); err == nil {
-		fmt.Printf("文件 %s start_time: %.6f\n", filename, startTime)
-		return startTime
-	} else {
-		fmt.Printf("文件 %s start_time解析失败: %s\n", filename, startTimeStr)
-		return 0
-	}
-}
 
-func isBakFile(filename string) bool {
-	return strings.Contains(strings.ToLower(filename), "bak")
+	if startTime, err := strconv.ParseFloat(startTimeStr, 64); err == nil {
+		return startTime
+	}
+	return 0
 }
 
 func copyFile(src, dst string) error {
@@ -143,19 +252,26 @@ func copyFile(src, dst string) error {
 }
 
 func mergeFiles(files []FileInfo, output string) error {
+	if len(files) == 0 {
+		return fmt.Errorf("没有文件要合并")
+	}
+
 	if len(files) == 1 {
 		return copyFile(files[0].Name, output)
 	}
-	listFile := "temp_list.txt"
+
+	listFile := fmt.Sprintf("temp_list_%s.txt", strings.ReplaceAll(output, "/", "_"))
 	f, err := os.Create(listFile)
 	if err != nil {
 		return err
 	}
+
 	for _, file := range files {
 		fmt.Fprintf(f, "file '%s'\n", file.Name)
 	}
 	f.Close()
 	defer os.Remove(listFile)
+
 	return ffmpeg.Input(listFile, ffmpeg.KwArgs{
 		"f":    "concat",
 		"safe": "0",
@@ -166,18 +282,30 @@ func mergeFiles(files []FileInfo, output string) error {
 }
 
 func mergeFinal(files []string, output string) error {
-	fmt.Printf("开始最终合并，重新生成时间戳\n")
+	if len(files) == 0 {
+		return fmt.Errorf("没有文件要最终合并")
+	}
+
+	if len(files) == 1 {
+		return ffmpeg.Input(files[0]).
+			Output(output, ffmpeg.KwArgs{"c": "copy"}).
+			OverWriteOutput().
+			Run()
+	}
+
 	listFile := "temp_final_list.txt"
 	f, err := os.Create(listFile)
 	if err != nil {
 		return err
 	}
+
 	for _, file := range files {
 		fmt.Fprintf(f, "file '%s'\n", file)
 	}
 	f.Close()
 	defer os.Remove(listFile)
-	err = ffmpeg.Input(listFile, ffmpeg.KwArgs{
+
+	return ffmpeg.Input(listFile, ffmpeg.KwArgs{
 		"f":    "concat",
 		"safe": "0",
 	}).
@@ -190,97 +318,73 @@ func mergeFinal(files []string, output string) error {
 		}).
 		OverWriteOutput().
 		Run()
-	if err != nil {
-		return err
-	}
-	fmt.Printf("合并成功\n")
-	return nil
 }
 
-func processVideoFiles(sourceDir string) {
-	entries, err := os.ReadDir(sourceDir)
-	if err != nil {
-		log.Fatal("读取目录失败:", err)
-	}
-	var allFiles []FileInfo
-	for _, entry := range entries {
-		if !entry.IsDir() && strings.HasSuffix(strings.ToLower(entry.Name()), ".ts") {
-			fullPath := filepath.Join(sourceDir, entry.Name())
-			fmt.Printf("分析文件: %s\n", fullPath)
-			startTime := getStartTime(fullPath)
-			allFiles = append(allFiles, FileInfo{
-				Name:      fullPath,
-				HasBak:    isBakFile(entry.Name()),
-				StartTime: startTime,
-			})
-		}
-	}
-	if len(allFiles) == 0 {
-		log.Fatal("没有找到TS文件")
-	}
-	var normalFiles, bakFiles []FileInfo
+func processAndMerge(allFiles []FileInfo) {
+	groupedFiles := make(map[string][]FileInfo)
 	for _, file := range allFiles {
-		if file.HasBak {
-			bakFiles = append(bakFiles, file)
-		} else {
-			normalFiles = append(normalFiles, file)
+		groupedFiles[file.Group] = append(groupedFiles[file.Group], file)
+	}
+
+	fmt.Printf("发现 %d 个分组:\n", len(groupedFiles))
+	for group, files := range groupedFiles {
+		fmt.Printf("  %s: %d个文件\n", group, len(files))
+	}
+
+	var mergedFiles []string
+	groupOrder := []string{"main"}
+	for i := 0; i < 10; i++ {
+		groupName := fmt.Sprintf("bak%d", i)
+		if _, exists := groupedFiles[groupName]; exists {
+			groupOrder = append(groupOrder, groupName)
 		}
 	}
-	sort.Slice(normalFiles, func(i, j int) bool {
-		return normalFiles[i].StartTime < normalFiles[j].StartTime
-	})
-	sort.Slice(bakFiles, func(i, j int) bool {
-		return bakFiles[i].StartTime < bakFiles[j].StartTime
-	})
-	fmt.Printf("普通文件: %d 个\n", len(normalFiles))
-	for i, file := range normalFiles {
-		fmt.Printf("  %d. %s (开始时间: %.6f)\n", i+1, filepath.Base(file.Name), file.StartTime)
+	if _, exists := groupedFiles["bak"]; exists {
+		groupOrder = append(groupOrder, "bak")
 	}
-	fmt.Printf("迁移文件: %d 个\n", len(bakFiles))
-	for i, file := range bakFiles {
-		fmt.Printf("  %d. %s (开始时间: %.6f)\n", i+1, filepath.Base(file.Name), file.StartTime)
-	}
-	var normalOutput, bakOutput string
-	if len(normalFiles) > 0 {
-		normalOutput = "merged_normal.ts"
-		fmt.Printf("合并普通文件到: %s\n", normalOutput)
-		if err := mergeFiles(normalFiles, normalOutput); err != nil {
-			log.Fatal("合并普通文件失败:", err)
+
+	for _, group := range groupOrder {
+		files, exists := groupedFiles[group]
+		if !exists {
+			continue
 		}
-	}
-	if len(bakFiles) > 0 {
-		bakOutput = "merged_bak.ts"
-		fmt.Printf("合并迁移文件到: %s\n", bakOutput)
-		if err := mergeFiles(bakFiles, bakOutput); err != nil {
-			log.Fatal("合并迁移文件失败:", err)
+
+		sort.Slice(files, func(i, j int) bool {
+			return files[i].StartTime < files[j].StartTime
+		})
+
+		fmt.Printf("\n合并%s组 (%d个文件):\n", group, len(files))
+		for i, file := range files {
+			fmt.Printf("  %d. %s (时间: %.6f)\n", i+1, filepath.Base(file.Name), file.StartTime)
 		}
-	}
-	var finalFiles []string
-	if normalOutput != "" {
-		finalFiles = append(finalFiles, normalOutput)
-	}
-	if bakOutput != "" {
-		finalFiles = append(finalFiles, bakOutput)
-	}
-	if len(finalFiles) > 1 {
-		fmt.Println("合并最终文件...")
-		if err := mergeFinal(finalFiles, "final_merged.mp4"); err != nil {
-			log.Fatal("最终合并失败:", err)
+
+		groupOutput := fmt.Sprintf("merged_%s.ts", group)
+		fmt.Printf("合并到: %s\n", groupOutput)
+		if err := mergeFiles(files, groupOutput); err != nil {
+			log.Printf("合并%s组失败: %v", group, err)
+			continue
 		}
-		fmt.Println("最终合并完成: final_merged.mp4")
-		for _, file := range finalFiles {
-			os.Remove(file)
-		}
-	} else if len(finalFiles) == 1 {
-		fmt.Println("转换为MP4...")
-		err := ffmpeg.Input(finalFiles[0]).
-			Output("final_merged.mp4", ffmpeg.KwArgs{"c": "copy"}).
-			OverWriteOutput().
-			Run()
-		if err != nil {
-			log.Fatal("转换MP4失败:", err)
-		}
-		fmt.Println("转换完成: final_merged.mp4")
-		os.Remove(finalFiles[0])
+		mergedFiles = append(mergedFiles, groupOutput)
 	}
+
+	if len(mergedFiles) == 0 {
+		log.Fatal("没有成功合并任何组")
+	}
+
+	fmt.Printf("\n最终合并 %d 个组文件:\n", len(mergedFiles))
+	for i, file := range mergedFiles {
+		fmt.Printf("  %d. %s\n", i+1, file)
+	}
+
+	finalOutput := "final_merged.mp4"
+	fmt.Printf("生成最终文件: %s\n", finalOutput)
+	if err := mergeFinal(mergedFiles, finalOutput); err != nil {
+		log.Fatal("最终合并失败:", err)
+	}
+
+	for _, file := range mergedFiles {
+		os.Remove(file)
+	}
+
+	fmt.Println("合并完成:", finalOutput)
 }
