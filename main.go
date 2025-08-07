@@ -37,7 +37,7 @@ type FFProbeResult struct {
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("用法: ./simple-merger <m3u8_url1> [m3u8_url2] ...")
+		fmt.Println("用法: ./merger <m3u8_url1> [m3u8_url2] ...")
 		os.Exit(1)
 	}
 	os.RemoveAll(tempDir)
